@@ -1,0 +1,285 @@
+---
+title: "HDDM for SI/Negatron"
+author: "Mike Frank"
+date: "February 16, 2016"
+output: 
+  html_document:
+    toc: true
+---
+
+Fit DDM and HDDM models to data from Negatron. 
+
+# Data Loading
+
+```{r global_options, include=FALSE}
+rm(list=ls())
+knitr::opts_chunk$set(fig.path='figs/',
+        echo=F, warning=F, cache=TRUE, message=F, sanitize = T)
+```
+
+```{r, libraries}
+library(ggplot2)
+library(lme4)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(langcog)
+library(RWiener)
+library(magrittr)
+library(ggmcmc)
+library(rstan)
+
+theme_set(theme_bw())
+```
+
+Data loading and cleaning. 
+
+```{r}
+d.turk <- read.csv("~/Projects/Negation/neginhib/long_data/long_data_mturk.csv") 
+n.turk.initial <- n.unique(d.turk$subid)
+
+d.turk <- d.turk %>%
+  # remove anyone who played fewer than 300 trials (means they did not complete at least half of the third game) or over 408 trials (means they completed the task twice, because 408 is max number of trials -- this only happened for one participant and I'm not sure how they were able to do this, so I'm rejecting them)
+  mutate(subid = factor(subid)) %>%
+  group_by(subid) %>%
+  mutate(ntrials = n()) %>%
+  filter(ntrials > 300 & ntrials < 408) %>%
+  ungroup() %>%
+  # create resp and rt vars
+  mutate(resp = factor(response, levels=c("Y","N"), labels=c("upper","lower")), 
+         q = rt/1000) %>%
+  # remove outlier RTs
+  filter(rt > 200, 
+         rt < 15000) %>% # filtering the mysterious neg rt...
+  filter(log(rt) < mean(log(rt)) + 3 * sd(log(rt)), 
+         log(rt) > mean(log(rt)) - 3 * sd(log(rt))) %>%
+  # clean up
+  select(subid, game, trial.num, trial.type, q, resp) %>%
+  mutate(agegroup = "adults") %>%
+  ungroup() 
+```
+
+# Single Subject Stan model
+
+```{r}
+
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+```
+
+The model.
+
+```{r}
+wiener_model <- "
+data {
+    int<lower=0> N;
+    real y[N];
+    int<lower=0, upper=1> resp[N];
+}
+
+parameters {
+    real<lower=0> bound_sep;
+    real<lower=0> nondecision;
+    real<lower=0, upper=1> bias;
+    real drift;
+}
+
+model {
+    drift ~ normal(0, 2);
+    bound_sep ~ gamma(3, 3);
+    nondecision ~ gamma(4, 10);
+    bias ~ beta(5, 5);
+
+    for (n in 1:N) {
+        if (resp[n] == 1) { // upper boundary for correct
+            y[n] ~ wiener(bound_sep, nondecision, bias, drift); 
+        }
+        else {  // lower boundary for incorrect
+            y[n] ~ wiener(bound_sep, nondecision, 1-bias, -drift); 
+        }
+    }
+}"
+```
+
+Make data from one subject into R format. Use negation because there weren't condition differences. 
+
+```{r}
+s1 <- filter(d.turk, subid=="1", game == "negation")
+
+standata <- list(y = s1$q, 
+                 resp = s1$resp == "upper",
+                 N = length(s1$resp))
+```
+
+Fit model. 
+
+```{r}
+single_fit <- stan(model_code = wiener_model, 
+            data = standata)
+```
+
+Sampler diagnostics. Try ggmcmc. From [http://blog.xavier-fim.net/2012/10/processing-stan-samples-with-ggmcmc-2/]().
+
+```{r}
+S <- ggs(single_fit)
+ggs_histogram(S)
+ggs_traceplot(S)
+ggs_running(S)
+ggs_autocorrelation(S)
+ggs_pairs(S)
+```
+
+Fit the same thing with RWiener.
+
+```{r}
+rw <- s1 %>%
+  select(q, resp) %>%
+  mutate(resp = as.character(resp)) %>%
+  data.frame
+
+opt <- optim(c(1, .1, .1, 1), wiener_deviance, 
+             dat=rw, method="Nelder-Mead")$par
+```
+
+Compare parameters. `wiener_deviance` returns alpha, tau, beta, delta (boundary, non-decision, bias, drift). 
+
+```{r}
+opt
+single_fit
+```
+
+# HDDM mixed model
+
+All numerical parameters from Wiecki, Sofer, & Frank (2013). 
+
+Params:
++ v - drift rate
++ b - bias, (0,1) bounded
++ a - decision threshold (positive)
++ t - nondecision time (positive)
+
+Note, stan's `gamma` takes shape and scale ($k$ and $\theta$), but WSF use mean ($k$) and rate ($1/\theta$). 
+
+```{r}
+hddm_model <- "
+data {
+    int<lower=0> N; // number of data points
+    int<lower=0> S;  // number of subjects
+    real y[N];
+    int<lower=0, upper=1> resp[N];
+    int sub[N];
+}
+
+parameters {
+    real mu_v;
+    real<lower=0> sigma_v;
+    real<lower=0> mu_a;
+    real<lower=0> sigma_a;
+    real mu_b;
+    real<lower=0> sigma_b;
+    real mu_t;
+    real<lower=0> sigma_t;
+
+    real v[S];
+    real<lower=0> a[S];
+    real<lower=0, upper=1> b[S];
+    real<lower=0> t[S];
+}
+
+model {
+    mu_v ~ normal(2,3);
+    mu_a ~ gamma(1.5, 1.33); // 1 / .74 (conversion from WTF)
+    mu_b ~ normal(.5,.5);
+    mu_t ~ gamma(.4,5); // 1 / .2 (conversion from WTF)
+
+    sigma_v ~ normal(0,2);
+    sigma_a ~ normal(0,.1); 
+    sigma_b ~ normal(0,.05);
+    sigma_t ~ normal(0,1);
+ 
+    // these should automatically vectorize
+    v ~ normal(mu_v, sigma_v^2);
+    a ~ gamma(mu_a, 1/sigma_a^2);  
+    b ~ normal(mu_b, sigma_b^2);
+    t ~ normal(mu_t, sigma_t^2);
+
+    // sub[N] should give the index for the subject-wise coefficients
+    // inv_logit(b) is to transform, as in WTF
+    for (n in 1:N) {
+        if (resp[n] == 1) {
+            y[n] ~ wiener(a[sub[n]], t[sub[n]], inv_logit(b[sub[n]]), v[sub[n]]);
+        }
+        else {
+            y[n] ~ wiener(a[sub[n]], t[sub[n]], 1 - inv_logit(b[sub[n]]), -v[sub[n]]);
+        }
+    }
+}"
+```
+
+Make data from N subjects into R format, fit using RWiener.
+
+```{r}
+ns <- 1:20
+ss <- unique(d.turk$subid)[ns]
+
+sd <- filter(d.turk, subid %in% ss) 
+
+params <- sd %>%
+  group_by(subid) %>%
+  do(data.frame(value = optim(c(1, .1, .1, 1), 
+                                       wiener_deviance, 
+                                       dat = data.frame(select(., q, resp)),
+                                       method = "Nelder-Mead")$par, 
+                param = c("a","t","b","v")))
+
+```
+
+```{r}
+standata <- list(y = sd$q, 
+                 resp = as.numeric(sd$resp=="upper"),
+                 N = length(sd$resp),
+                 sub = as.numeric(factor(sd$subid)),
+                 S = length(unique(sd$subid)))
+```
+
+```{r}
+fit <- stan(model_code = hddm_model, 
+            data = standata, 
+            iter = 50)
+```
+
+Sampler diagnostics. 
+
+```{r}
+S <- ggs(fit)
+ggs_density(S, family = "_")
+ggs_traceplot(S, family = "_")
+ggs_pairs(S, family = "_")
+```
+
+So it's clear that chains are not mixing appropriately. 
+
+Compare parameters. 
+  
+```{r}
+subs <- data.frame(summary(fit)$summary) %>%
+  mutate(param = str_replace(row.names(.),"]","")) %>%
+  separate(param, into=c("param", "sub_id"), sep = "\\[") %>%
+  filter(!is.na(sub_id)) %>%
+  mutate(sub = as.numeric(sub_id)) %>%
+  select(sub, param, mean)
+
+both <- params %>%
+  ungroup %>%
+  left_join(subs) %>%
+  rename(ddm = value, 
+         hddm = mean)
+
+ggplot(both, aes(x=ddm, y = hddm, label=sub)) +
+  geom_text() +
+  geom_smooth(method="lm", se=FALSE) +
+  facet_wrap(~param, scales="free")
+```
+
+So this is a bit worrisome - there is not a bit correlation at the subject level. Actually, WTF don't fit at the subject level, they fit at the group level, with some subject variance. 
+
