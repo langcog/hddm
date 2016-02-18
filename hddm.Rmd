@@ -62,7 +62,6 @@ d.turk <- d.turk %>%
 # Single Subject Stan model
 
 ```{r}
-
 rstan_options(auto_write = TRUE)
 options(mc.cores = parallel::detectCores())
 ```
@@ -171,46 +170,38 @@ data {
 }
 
 parameters {
-    real mu_v;
-    real<lower=0> sigma_v;
-    real<lower=0> mu_a;
-    real<lower=0> sigma_a;
-    real mu_b;
-    real<lower=0> sigma_b;
-    real mu_t;
-    real<lower=0> sigma_t;
+    real mu_drift;
+    real<lower=0> sigma_drift;
+    real drift[S];
 
-    real v[S];
-    real<lower=0> a[S];
-    real<lower=0, upper=1> b[S];
-    real<lower=0> t[S];
+    real<lower=0> bound_sep;
+    real<lower=0> nondecision;
+    real<lower=0, upper=1> bias;
+
+    real<lower=0> eta;
+    real delta[N];
 }
 
 model {
-    mu_v ~ normal(2,3);
-    mu_a ~ gamma(1.5, 1.33); // 1 / .74 (conversion from WTF)
-    mu_b ~ normal(.5,.5);
-    mu_t ~ gamma(.4,5); // 1 / .2 (conversion from WTF)
+    mu_drift ~ normal(0,2);
+    sigma_drift ~ normal(0,.2);
 
-    sigma_v ~ normal(0,2);
-    sigma_a ~ normal(0,.1); 
-    sigma_b ~ normal(0,.05);
-    sigma_t ~ normal(0,1);
- 
-    // these should automatically vectorize
-    v ~ normal(mu_v, sigma_v^2);
-    a ~ gamma(mu_a, 1/sigma_a^2);  
-    b ~ normal(mu_b, sigma_b^2);
-    t ~ normal(mu_t, sigma_t^2);
+    drift ~ normal(mu_drift, sigma_drift^2);
+    bound_sep ~ gamma(3, 3);
+    nondecision ~ gamma(4, 10);
+    bias ~ beta(5, 5);
 
-    // sub[N] should give the index for the subject-wise coefficients
-    // inv_logit(b) is to transform, as in WTF
+    eta ~ normal(0,.5);
+
+    // sub[n] should give the index for the subject-wise coefficients
     for (n in 1:N) {
+        delta[n] ~ normal(drift[sub[n]], eta);
+
         if (resp[n] == 1) {
-            y[n] ~ wiener(a[sub[n]], t[sub[n]], inv_logit(b[sub[n]]), v[sub[n]]);
-        }
+            y[n] ~ wiener(bound_sep, nondecision, bias, delta[n]);
+        } 
         else {
-            y[n] ~ wiener(a[sub[n]], t[sub[n]], 1 - inv_logit(b[sub[n]]), -v[sub[n]]);
+            y[n] ~ wiener(bound_sep, nondecision, 1-bias, -delta[n]);
         }
     }
 }"
@@ -245,7 +236,8 @@ standata <- list(y = sd$q,
 ```{r}
 fit <- stan(model_code = hddm_model, 
             data = standata, 
-            iter = 50)
+            iter = 200, 
+            chains = 4)
 ```
 
 Sampler diagnostics. 
@@ -257,7 +249,6 @@ ggs_traceplot(S, family = "_")
 ggs_pairs(S, family = "_")
 ```
 
-So it's clear that chains are not mixing appropriately. 
 
 Compare parameters. 
   
